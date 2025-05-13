@@ -1,0 +1,401 @@
+'use client';
+
+import { useEffect, useState } from 'react';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { AlertTriangle, Loader2, CheckCircle2, Upload, Database, RefreshCw } from 'lucide-react';
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { Button } from '@/components/ui/button';
+import Link from 'next/link';
+import ProcessingIndicator from '@/components/processing-indicator';
+import { API_URL } from '@/lib/api';
+import { FallbackState } from '@/components/fallback-state';
+
+// DeviceCount cache - persisted to localStorage across page refreshes
+interface DeviceCountCache {
+  count: number;
+  timestamp: number;
+}
+
+// Global cache (with localStorage persistence)
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes (increased from 1 minute)
+const CACHE_KEY = 'scm_device_count_cache';
+
+// Load cache from localStorage if available
+const loadCachedCount = (): DeviceCountCache | null => {
+  if (typeof window === 'undefined') return null;
+  
+  try {
+    const cached = localStorage.getItem(CACHE_KEY);
+    return cached ? JSON.parse(cached) : null;
+  } catch (e) {
+    console.error('Failed to load cache:', e);
+    return null;
+  }
+};
+
+// Save cache to localStorage
+const saveCountToCache = (count: number) => {
+  if (typeof window === 'undefined') return;
+  
+  try {
+    const data: DeviceCountCache = {
+      count,
+      timestamp: Date.now()
+    };
+    localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+  } catch (e) {
+    console.error('Failed to save cache:', e);
+  }
+};
+
+export default function Dashboard() {
+  const [deviceCount, setDeviceCount] = useState<number | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [hasError, setHasError] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
+  const [retryCount, setRetryCount] = useState(0);
+  const [apiStatus, setApiStatus] = useState<'connected' | 'error' | 'loading'>('loading');
+
+  useEffect(() => {
+    async function fetchData() {
+      // Clear any potentially incorrect cache data
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem(CACHE_KEY);
+      }
+      
+      // Don't set loading state if we already have cached data
+      const storedCache = loadCachedCount();
+      if (storedCache) {
+        const currentTime = Date.now();
+        if (currentTime - storedCache.timestamp < CACHE_DURATION) {
+          // Immediately set cached data to avoid flicker
+          setDeviceCount(storedCache.count);
+          setApiStatus('connected'); // Optimistic UI
+          setHasError(false);
+          setErrorMessage('');
+        }
+      } else {
+        setIsLoading(true);
+      }
+      
+      try {
+        // Try the health endpoint first with a very short timeout
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 2000); // Even shorter timeout (2s)
+        
+        try {
+          const response = await fetch(`${API_URL}/health`, { 
+            signal: controller.signal
+          });
+          clearTimeout(timeoutId);
+          
+          if (response.ok) {
+            setApiStatus('connected');
+            
+            // Get device count using the lightweight endpoint
+            const countController = new AbortController();
+            const countTimeoutId = setTimeout(() => countController.abort(), 2000); // Short 2s timeout
+            
+            try {
+              const countResponse = await fetch(`${API_URL}/device-count`, {
+                signal: countController.signal
+              });
+              clearTimeout(countTimeoutId);
+              
+              if (countResponse.ok) {
+                const data = await countResponse.json();
+                const count = data.count || 0;
+                
+                // Update state and cache
+                setDeviceCount(count);
+                saveCountToCache(count);
+                setHasError(false);
+                setErrorMessage('');
+              } else {
+                throw new Error('Failed to fetch device count');
+              }
+            } catch (countError: any) {
+              console.error("Error fetching device count:", countError);
+              // Keep using the loaded cache instead of showing error
+              if (deviceCount === null) {
+                if (storedCache) {
+                  // Use cached data on error
+                  setDeviceCount(storedCache.count);
+                  setApiStatus('error'); // Still show error indicator
+                  setHasError(false);
+                } else {
+                  throw countError; // Re-throw only if we don't have any cached data
+                }
+              }
+            }
+          } else {
+            setApiStatus('error');
+            // Try using cached data before throwing
+            if (deviceCount === null && storedCache) {
+              setDeviceCount(storedCache.count);
+              setHasError(false);
+            } else if (deviceCount === null) {
+              throw new Error('API server returned an error status');
+            }
+          }
+        } catch (healthError: any) {
+          clearTimeout(timeoutId);
+          
+          // If we have a cached count (either from localStorage or prior fetch), keep using it
+          if (deviceCount === null) {
+            if (storedCache) {
+              setDeviceCount(storedCache.count);
+              setApiStatus('error'); // Still show error indicator
+              setHasError(false);
+            } else {
+              setHasError(true);
+              setErrorMessage(healthError.name === 'AbortError' ? 
+                'Connection timed out. Server may be busy processing data.' : 
+                healthError.message || 'Failed to connect to API server');
+              setApiStatus('error');
+            }
+          } else {
+            // We already have data, just update status
+            setApiStatus('error');
+          }
+        }
+      } catch (error: any) {
+        console.error("Error in data fetching flow:", error);
+        setApiStatus('error');
+        
+        // If we have any cached count, use it even during errors
+        if (deviceCount === null) {
+          if (storedCache) {
+            setDeviceCount(storedCache.count);
+            setHasError(false);
+          } else {
+            setHasError(true);
+            setErrorMessage(error.name === 'AbortError' ? 
+              'Connection timed out. Server may be busy processing data.' : 
+              error.message || 'Failed to connect to API server');
+          }
+        }
+      } finally {
+        setIsLoading(false);
+      }
+    }
+
+    fetchData();
+    
+    // Set up an interval to periodically refresh in the background (every 2 minutes)
+    const intervalId = setInterval(() => {
+      setRetryCount(prev => prev + 1);
+    }, 2 * 60 * 1000);
+    
+    return () => clearInterval(intervalId);
+  }, [retryCount, deviceCount]);
+
+  const handleRetry = () => {
+    setRetryCount(prev => prev + 1);
+  };
+
+  if (isLoading && deviceCount === null) {
+    return (
+      <div className="flex flex-col items-center justify-center h-[60vh]">
+        <Loader2 className="h-12 w-12 animate-spin text-primary mb-4" />
+        <p className="text-lg text-muted-foreground">Loading dashboard data...</p>
+      </div>
+    );
+  }
+
+  if (hasError && deviceCount === null) {
+    return (
+      <div className="py-6">
+        <Alert variant="destructive" className="mb-6">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertTitle>Connection Error</AlertTitle>
+          <AlertDescription>{errorMessage || 'Could not connect to the API server'}</AlertDescription>
+        </Alert>
+        
+        <div className="text-center mt-8">
+          <Button 
+            onClick={handleRetry} 
+            className="flex items-center gap-2"
+          >
+            <RefreshCw className="h-4 w-4" />
+            Try Again
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  const hasData = deviceCount !== null && deviceCount > 0;
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-3xl font-bold tracking-tight">SCM Device Observability</h1>
+        <p className="text-muted-foreground">
+          Track and monitor devices across your supply chain
+        </p>
+      </div>
+
+      <div className="h-6">
+        <ProcessingIndicator />
+      </div>
+
+      {!hasData ? (
+        <div className="bg-muted p-8 rounded-lg text-center">
+          <h2 className="text-2xl font-semibold mb-2">No Devices Found</h2>
+          <p className="text-muted-foreground mb-6">
+            No device data is available yet. Upload some Excel files to get started.
+          </p>
+          <div className="flex justify-center items-center gap-3">
+            <Upload className="w-5 h-5" />
+            <Button asChild>
+              <Link href="/upload">Upload Files</Link>
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
+          <Card className={`relative overflow-hidden ${apiStatus === 'error' ? 'border-amber-300' : ''}`}>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium flex items-center gap-2">
+                <Database className="h-4 w-4" />
+                Tracked Devices
+                {apiStatus === 'error' && (
+                  <div className="text-amber-500 text-xs flex items-center">
+                    <span className="relative flex h-2 w-2 mr-1">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500"></span>
+                    </span>
+                    <span title="Using cached data">Stale Data</span>
+                  </div>
+                )}
+              </CardTitle>
+              <CardDescription>Total devices tracked in the system</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <FallbackState
+                isLoading={isLoading && deviceCount === null}
+                hasError={hasError}
+                errorMessage={errorMessage}
+                onRetry={handleRetry}
+              >
+                <div className="text-3xl font-bold">
+                  {deviceCount !== null ? deviceCount.toLocaleString() : '--'}
+                </div>
+                <div className="text-xs text-muted-foreground mt-1">
+                  {apiStatus === 'error' && deviceCount !== null 
+                    ? "From cache - click refresh to update" 
+                    : "Devices in database"}
+                </div>
+              </FallbackState>
+            </CardContent>
+            {(apiStatus === 'error' || hasError) && (
+              <div className="absolute bottom-2 right-2">
+                <Button 
+                  variant="ghost" 
+                  size="icon"
+                  onClick={handleRetry}
+                  title="Retry connection"
+                  className="hover:bg-amber-100"
+                >
+                  <RefreshCw className="h-4 w-4" />
+                </Button>
+              </div>
+            )}
+          </Card>
+          
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle>API Status</CardTitle>
+              <CardDescription>Connection status</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="flex items-center">
+                {apiStatus === 'connected' ? (
+                  <>
+                    <CheckCircle2 className="h-5 w-5 text-green-500 mr-2" />
+                    <span className="text-xl font-medium">Connected</span>
+                  </>
+                ) : apiStatus === 'loading' ? (
+                  <>
+                    <Loader2 className="h-5 w-5 animate-spin text-amber-500 mr-2" />
+                    <span className="text-xl font-medium">Connecting...</span>
+                  </>
+                ) : (
+                  <>
+                    <AlertTriangle className="h-5 w-5 text-amber-500 mr-2" />
+                    <span className="text-xl font-medium">Reconnecting...</span>
+                  </>
+                )}
+              </div>
+              <div className="text-xs text-muted-foreground mt-1">
+                {apiStatus === 'connected' 
+                  ? 'Backend API is responding'
+                  : apiStatus === 'error' && deviceCount !== null
+                  ? 'Using cached data - trying to reconnect'
+                  : 'Attempting to connect to server'}
+              </div>
+              {apiStatus === 'error' && (
+                <Button 
+                  onClick={handleRetry} 
+                  variant="outline" 
+                  size="sm" 
+                  className="mt-2 text-xs"
+                >
+                  <RefreshCw className="h-3 w-3 mr-1" />
+                  Retry Connection
+                </Button>
+              )}
+            </CardContent>
+          </Card>
+          
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle>Data Status</CardTitle>
+              <CardDescription>Database information</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="flex items-center">
+                <Database className="h-5 w-5 text-blue-500 mr-2" />
+                <span className="text-xl font-medium">Ready</span>
+              </div>
+              <div className="text-xs text-muted-foreground mt-1">System is ready for data operations</div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+      
+      {hasData && (
+        <div className="grid gap-6 md:grid-cols-2">
+          <Card>
+            <CardHeader>
+              <CardTitle>View Devices</CardTitle>
+              <CardDescription>
+                Explore all device data and history
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Button asChild className="w-full">
+                <Link href="/devices">Browse Devices</Link>
+              </Button>
+            </CardContent>
+          </Card>
+          
+          <Card>
+            <CardHeader>
+              <CardTitle>Check Analytics</CardTitle>
+              <CardDescription>
+                View performance dashboards
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Button asChild className="w-full" variant="outline">
+                <Link href="/analytics">View Analytics</Link>
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+    </div>
+  );
+}
