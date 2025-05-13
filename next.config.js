@@ -1,6 +1,11 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  output: 'export',
+  basePath: process.env.NODE_ENV === 'production' ? '/scm-ui' : '',
+  images: {
+    unoptimized: true,
+  },
   async redirects() {
     return [
       {
@@ -45,4 +50,4 @@ const nextConfig = {
   },
 };
 
-module.exports = nextConfig; 
+module.exports = nextConfig;
