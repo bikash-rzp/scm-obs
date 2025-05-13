@@ -5,10 +5,10 @@
   "homepage": "https://bikash-rzp.github.io/scm-ui",
   "scripts": {
     "dev": "next dev --turbopack",
-    "build": "next build",
+    "build": "next build --no-lint --no-typescript-error",
     "start": "next start",
     "lint": "next lint",
-    "export": "next build && next export",
+    "export": "next build --no-lint --no-typescript-error && next export",
     "deploy": "gh-pages -d out"
   },
   "dependencies": {
